@@ -437,6 +437,8 @@ class MailService(ConfigService):
         return True
 
     def _get_smtp_server(self, config, timeout=300, local_hostname=None):
+        self.middleware.call_sync('system.advanced.declare_outbound_network_activity')
+
         if local_hostname is None:
             local_hostname = socket.gethostname()
 

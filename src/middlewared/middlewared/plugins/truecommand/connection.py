@@ -9,6 +9,7 @@ class TruecommandAPIMixin:
     PORTAL_URI = 'https://portal.ixsystems.com/api'
 
     async def _post_call(self, options=None, payload=None):
+        await self.middleware.call('system.advanced.declare_outbound_network_activity')
         options = options or {}
         timeout = options.get('timeout', 15)
         response = {'error': None, 'response': {}}

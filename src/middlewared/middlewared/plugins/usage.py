@@ -18,8 +18,9 @@ class UsageService(Service):
 
     async def start(self):
         if (
-            await self.middleware.call('system.general.config')
-        )['usage_collection']:
+            await self.middleware.call('system.advanced.can_perform_outbound_network_activity') and
+            (await self.middleware.call('system.general.config'))['usage_collection']
+        ):
             try:
                 gather = await self.middleware.call('usage.gather')
                 async with aiohttp.ClientSession(

@@ -114,6 +114,9 @@ class UpdateService(Service):
         Returns available trains dict and the currently configured train as well as the
         train of currently booted environment.
         """
+
+        self.middleware.call_sync('system.advanced.declare_outbound_network_activity')
+
         data = self.middleware.call_sync('datastore.config', 'system.update')
 
         trains_data = self.middleware.call_sync('update.get_trains_data')
@@ -316,6 +319,7 @@ class UpdateService(Service):
 
     @private
     async def download_update(self, *args):
+        await self.middleware.call('system.advanced.declare_outbound_network_activity')
         success = await self.middleware.call('update.download_impl', *args)
         await self.middleware.call('alert.alert_source_clear_run', 'HasUpdate')
         return success

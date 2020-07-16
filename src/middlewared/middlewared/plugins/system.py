@@ -67,6 +67,7 @@ class SystemAdvancedModel(sa.Model):
     adv_uploadcrash = sa.Column(sa.Boolean(), default=True)
     adv_anonstats = sa.Column(sa.Boolean(), default=True)
     adv_anonstats_token = sa.Column(sa.Text())
+    adv_outbound_network = sa.Column(sa.Boolean())
     adv_motd = sa.Column(sa.Text(), default='Welcome')
     adv_boot_scrub = sa.Column(sa.Integer(), default=7)
     adv_fqdn_syslog = sa.Column(sa.Boolean(), default=False)
@@ -201,6 +202,7 @@ class SystemAdvancedService(ConfigService):
             Bool('traceback'),
             Bool('uploadcrash'),
             Bool('anonstats'),
+            Bool('outbound_network'),
             Str('sed_user', enum=['USER', 'MASTER']),
             Str('sed_passwd', private=True),
             Str('sysloglevel', enum=['F_EMERG', 'F_ALERT', 'F_CRIT', 'F_ERR',
@@ -341,6 +343,16 @@ class SystemAdvancedService(ConfigService):
             self.logger.warn('autotune for [%s] failed with error: [%s].',
                              conf, cp.stderr.decode())
         return cp.returncode
+
+    @private
+    async def can_perform_outbound_network_activity(self):
+        config = await self.middleware.call('system.advanced.config')
+        return config['outbound_network']
+
+    @private
+    async def declare_outbound_network_activity(self):
+        if not await self.middleware.call('system.advanced.can_perform_outbound_network_activity'):
+            raise CallError('Outbound network activities are disabled')
 
 
 class SystemService(Service):
