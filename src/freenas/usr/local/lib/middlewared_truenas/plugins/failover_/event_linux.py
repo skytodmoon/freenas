@@ -7,7 +7,6 @@
 from collections import defaultdict
 from threading import Lock
 import os
-import subprocess
 import time
 import contextlib
 import shutil
@@ -71,32 +70,6 @@ FAILOVER_SUCCESSFUL = False
 # the state of a service to the other controller since
 # that's being handled by us explicitly
 HA_PROPAGATE = {'ha_propagate': False}
-
-# TODO: REMOVE ME ONCE vrrp_backup has been fixed
-FENCED_EVENT = '/tmp/.failover_override'
-FAILOVER_ASSUMED_MASTER = '/tmp/.failover_master'
-FAILOVER_EVENT = '/tmp/.failover_event'
-FAILOVER_NEEDOP = '/tmp/.failover_needop'
-
-
-def run(cmd, stderr=False):
-    proc = subprocess.Popen(
-        cmd,
-        stderr=subprocess.PIPE if not stderr else subprocess.STDOUT,
-        stdout=subprocess.PIPE,
-        shell=True,
-        encoding='utf8',
-    )
-    output = proc.communicate()[0]
-    return (proc.returncode, output.strip('\n'))
-
-
-def run_async(cmd):
-    subprocess.Popen(
-        cmd,
-        shell=True,
-    )
-    return
 
 
 class ZpoolExportTimeout(Exception):
@@ -562,6 +535,10 @@ async def vrrp_fifo_hook(middleware, data):
 
     iface = data[1].strip('"')  # interface
     state = data[2]  # the state that is being transititoned to
+
+    # we only care about MASTER or BACKUP events currently
+    if state not in ('MASTER', 'BACKUP'):
+        return
 
     middleware.send_event(
         'failover.vrrp_event',
