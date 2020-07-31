@@ -4,15 +4,14 @@
 # and may not be copied and/or distributed
 # without the express permission of iXsystems.
 
-from lockfile import LockFile, AlreadyLocked
 from collections import defaultdict
 from threading import Lock
 import os
 import subprocess
 import time
-import struct
 import contextlib
 import shutil
+import signal
 
 from middlewared.utils import filter_list
 from middlewared.service import Service, private
@@ -51,18 +50,33 @@ ZPOOL_CACHE_FILE_SAVED = f'{ZPOOL_CACHE_FILE}.saved'
 # Samba sentinel file
 SAMBA_USER_IMPORT_FILE = "/root/samba/.usersimported"
 
-# This sentinel is created by the pool decryption
-# script to let us know we need to do something
-FAILOVER_NEEDOP = '/tmp/.failover_needop'
-
 # This file is managed in unscheduled_reboot_alert.py
 # Ticket 39114
 WATCHDOG_ALERT_FILE = "/data/sentinels/.watchdog-alert"
+
+# this is the time limit we place on exporting the
+# zpool(s) when becoming the BACKUP node
+ZPOOL_EXPORT_TIMEOUT = 4  # seconds
+
+# list of critical services that get restarted first
+# before the other services during a failover event
+CRITICAL_SERVICES = ['iscsitarget', 'cifs', 'nfs', 'afp']
+
+# boolean that represents if a failover event was successful
+# or not
+FAILOVER_SUCCESSFUL = False
+
+# option to be given when changing the state of a service
+# during a failover event, we do not want to replicate
+# the state of a service to the other controller since
+# that's being handled by us explicitly
+HA_PROPAGATE = {'ha_propagate': False}
 
 # TODO: REMOVE ME ONCE vrrp_backup has been fixed
 FENCED_EVENT = '/tmp/.failover_override'
 FAILOVER_ASSUMED_MASTER = '/tmp/.failover_master'
 FAILOVER_EVENT = '/tmp/.failover_event'
+FAILOVER_NEEDOP = '/tmp/.failover_needop'
 
 
 def run(cmd, stderr=False):
@@ -85,6 +99,24 @@ def run_async(cmd):
     return
 
 
+class ZpoolExportTimeout(Exception):
+
+    """
+    This is raised if we can't export the
+    zpool(s) from the system when becoming
+    BACKUP
+    """
+    pass
+
+
+class IgnoreFailoverEvent(Exception):
+
+    """
+    This is raised when a failover event is ignored.
+    """
+    pass
+
+
 class FailoverService(Service):
 
     @private
@@ -96,22 +128,47 @@ class FailoverService(Service):
 
     @private
     def event(self, ifname, event):
+
+        refresh = True
         try:
             return self._event(ifname, event)
+        except IgnoreFailoverEvent:
+            refresh = False
         finally:
-            self.run_call('failover.status_refresh')
+            # refreshing the failover status can cause delays in failover
+            # there is no reason to refresh it if the event has been ignored
+            if refresh:
+                self.run_call('failover.status_refresh')
+
+    def _zpool_export_sig_alarm(self, sig, tb):
+
+        raise ZpoolExportTimeout()
 
     @private
     def generate_failover_data(self):
 
-        # only care about name and guid
-        volumes = self.run_call('pool.query', [], {'select': ['name', 'guid']})
+        # only care about name, guid, and status
+        volumes = self.run_call(
+            'pool.query', [],
+            {
+                'select': ['name', 'guid', 'status']
+            }
+        )
+
+        # get list of all services on system
+        # we query db directly since on SCALE calling `service.query`
+        # actually builds a list of all services and includes if they're
+        # running or not. Probing all services on the system to see if
+        # they're running takes longer than what we need since failover
+        # needs to be as fast as possible.
+        services = self.run_call('datastore.query', 'services_services')
 
         failovercfg = self.run_call('failover.config')
         interfaces = self.run_call('interface.query')
         internal_ints = self.run_call('failover.internal_interfaces')
 
         data = {
+            'services': services,
             'disabled': failovercfg['disabled'],
             'master': failovercfg['master'],
             'timeout': failovercfg['timeout'],
@@ -137,7 +194,7 @@ class FailoverService(Service):
         # if there is, ignore it
         if EVENT_LOCK.locked():
             self.logger.warning('Failover event is already being processed, ignoring.')
-            return
+            raise IgnoreFailoverEvent()
 
         forcetakeover = False
         if event == 'forcetakeover':
@@ -165,7 +222,7 @@ class FailoverService(Service):
                 ignore = [i for i in fobj['non_crit_interfaces'] if i in ifname]
                 if ignore:
                     self.logger.warning(f'Ignoring state change on non-critical interface:{ifname}.')
-                    return
+                    raise IgnoreFailoverEvent()
 
                 # if the other controller is already master, then assume backup
                 try:
@@ -212,9 +269,6 @@ class FailoverService(Service):
     @private
     def vrrp_master(self, fobj, ifname, vhid, event, force_fenced, forcetakeover):
 
-        # this is the boolean we return to our caller
-        failover_successful = False
-
         # first thing to do is stop fenced process just in case it's running already
         # we will restart it based on args passed to us
         # NOTE: this does not cause concern because:
@@ -251,10 +305,7 @@ class FailoverService(Service):
             else:
                 self.logger.warn(f'Fenced exited with code:{fenced_error} which should never happen, exiting!')
 
-            return failover_successful
-
-        # At this point, fenced is daemonized and drives have been reserved.
-        # Bring up all carps we own.
+            return FAILOVER_SUCCESSFUL
 
         # remove the zpool cache files if necessary
         if os.path.exists(ZPOOL_KILLCACHE):
@@ -316,7 +367,7 @@ class FailoverService(Service):
                 )
 
             self.logger.error('All volumes failed to import!')
-            return failover_successful
+            return FAILOVER_SUCCESSFUL
 
         # if we fail to import any of the zpools then alert the user but continue the process
         for i in failed:
@@ -332,7 +383,7 @@ class FailoverService(Service):
         self.logger.info('Refreshing failover status')
         self.run_call('failover.status_refresh')
 
-        # calling this actually generates a file
+        # this enables all necessary services that have been enabled by the user
         self.logger.info('Enabling necessary services.')
         self.run_call('etc.generate', 'rc')
 
@@ -344,31 +395,19 @@ class FailoverService(Service):
         # Now we restart the appropriate services to ensure it's using correct certs.
         self.run_call('service.restart', 'http')
 
-        # classify list of "critical" services
-        critical_services = ['iscsitarget', 'nfs', 'cifs', 'afp']
-        ha_propagate = {'ha_propagate': False}
-
-        # get list of all services on system
-        # we query db directly since on SCALE calling `service.query`
-        # actually builds a list of all services and includes if they're
-        # running or not. Probing all services on the system to see if
-        # they're running takes longer than what we need since failover
-        # needs to be as fast as possible.
-        services = self.run_call('datastore.query', 'services_services')
-
         # now we restart the services, prioritizing the "critical" services
         self.logger.info('Restarting critical services.')
-        for i in critical_services:
-            for j in services:
+        for i in CRITICAL_SERVICES:
+            for j in fobj['services']:
                 if i == j['srv_service'] and j['srv_enable']:
                     self.logger.info(f'Restarting critical service:{i}')
-                    self.run_call('service.restart', i, ha_propagate)
+                    self.run_call('service.restart', i, HA_PROPAGATE)
 
         # TODO: look at nftables
         # self.logger.info('Allowing network traffic.')
         # run('/sbin/pfctl -d')
 
-        self.logger.info('Critical portion of failover is now complete.')
+        self.logger.info('Critical portion of failover is now complete')
 
         # regenerate cron
         self.logger.info('Regenerating cron')
@@ -385,15 +424,15 @@ class FailoverService(Service):
         self.logger.info('Restarting remaining services')
 
         self.logger.info('Restarting collected')
-        self.run_call('service.restart', 'collectd', ha_propagate)
+        self.run_call('service.restart', 'collectd', HA_PROPAGATE)
 
         self.logger.info('Restarting syslog-ng')
-        self.run_call('service.restart', 'syslogd', ha_propagate)
+        self.run_call('service.restart', 'syslogd', HA_PROPAGATE)
 
-        for i in services:
-            if i['srv_service'] not in critical_services and i['srv_enable']:
+        for i in fobj['services']:
+            if i['srv_service'] not in CRITICAL_SERVICES and i['srv_enable']:
                 self.logger.info('Restarting service:{i["srv_service"]}')
-                self.run_call('service.restart', i['srv_service'], ha_propagate)
+                self.run_call('service.restart', i['srv_service'], HA_PROPAGATE)
 
         # TODO: jails don't exist on SCALE (yet)
         # TODO: vms don't exist on SCALE (yet)
@@ -406,7 +445,7 @@ class FailoverService(Service):
 
         kmip_config = self.run_call('kmip.config')
         if kmip_config and kmip_config['enabled']:
-            self.logger.info('Initializing KMIP sync')
+            self.logger.info('Syncing encryption keys with KMIP server')
 
             # Even though we keep keys in sync, it's best that we do this as well
             # to ensure that the system is up to date with the latest keys available
@@ -415,209 +454,103 @@ class FailoverService(Service):
             self.run_call('kmip.initialize_keys')
 
         self.logger.warn('Failover event complete.')
-
         failover_succesful = True
+
         return failover_succesful
 
     @private
-    def carp_backup(self, fobj, ifname, vhid, event, user_override):
-        self.logger.warn('Entering BACKUP on %s', ifname)
+    def vrrp_backup(self, fobj, ifname, event, force_fenced):
 
-        if not user_override:
-            sleeper = fobj['timeout']
-            # The specs for lagg require that if a subinterface of the lagg interface
-            # changes state, all traffic on the entire logical interface will be halted
-            # for two seconds while the bundle reconverges.  This means if there's a
-            # toplogy change on the active node, the standby node will get a link_up
-            # event on the lagg.  To  prevent the standby node from immediately pre-empting
-            # we wait 2 seconds to see if the evbent was transient.
-            if ifname.startswith('lagg'):
-                if sleeper < 2:
-                    sleeper = 2
-            else:
-                # Check interlink - if it's down there is no need to wait.
-                for iface in fobj['internal_interfaces']:
-                    error, output = run(
-                        f"ifconfig {iface} | grep 'status:' | awk '{{print $2}}'"
-                    )
-                    if output != 'active':
-                        break
-                else:
-                    if sleeper < 2:
-                        sleeper = 2
+        self.logger.warning(f'Entering BACKUP on {ifname}')
 
-            if sleeper != 0:
-                self.logger.warn('Sleeping %s seconds and rechecking %s', sleeper, ifname)
-                time.sleep(sleeper)
-                error, output = run(
-                    f"ifconfig {ifname} | grep 'carp:' | awk '{{print $2}}'"
-                )
-                if output == 'MASTER':
-                    self.logger.warn(
-                        'Ignoring state on %s because it changed back to MASTER after '
-                        '%s seconds.', ifname, sleeper,
-                    )
-                    return True
+        # we need to stop fenced first
+        self.run_call('failover.fenced.stop')
 
-        """
-        We check if we have at least one MASTER interface per group.
-        If that turns out to be true we ignore the BACKUP state in one of the
-        interfaces, otherwise we assume backup demoting carps.
-        """
-        ignoreall = True
-        for group, carpint in list(fobj['groups'].items()):
-            totoutput = 0
-            ignore = False
-            for i in carpint:
-                error, output = run(f"ifconfig {i} | grep -c 'carp: MASTER'")
-                totoutput += int(output)
+        # restarting keepalived sends a priority 0 advertisement
+        # which means any VIP that is on this controller will be
+        # migrated to the other controller
+        self.logger.info('Transitioning all VIPs off this node')
+        self.run_call('service.restart', 'keepalived')
 
-                if not error and totoutput > 0:
-                    ignore = True
-                    break
-            ignoreall &= ignore
+        # TODO: look at nftables
+        # self.logger.info('Enabling firewall')
+        # run('/sbin/pfctl -ef /etc/pf.conf.block')
 
-        if ignoreall:
-            self.logger.warn(
-                'Ignoring DOWN state on %s because we still have interfaces that '
-                'are UP.', ifname)
-            return False
+        # ticket 23361 enabled a feature to send email alerts when an unclean reboot occurrs.
+        # TrueNAS HA, by design, has a triggered unclean shutdown.
+        # If a controller is demoted to standby, we set a 4 sec countdown using watchdog.
+        # If the zpool(s) can't export within that timeframe, we use watchdog to violently reboot the controller.
+        # When this occurrs, the customer gets an email about an "Unauthorized system reboot".
+        # The idea for creating a new sentinel file for watchdog related panics,
+        # is so that we can send an appropriate email alert.
+        # So if we panic here, middleware will check for this file and send an appropriate email.
+        # ticket 39114
+        with contextlib.suppress(Exception):
+            with open(WATCHDOG_ALERT_FILE, 'w') as f:
+                f.write(int(time.time()))
+                f.flush()  # be sure it goes straight to disk
+                os.fsync(f.fileno())  # be EXTRA sure it goes straight to disk
 
-        # Start the critical section
+        # set a countdown = to ZPOOL_EXPORT_TIMEOUT.
+        # if we can't export the zpool(s) in this timeframe,
+        # we send the 'b' character to the /proc/sysrq-trigger
+        # to trigger an immediate reboot of the system without
+        # syncing anything to disk or stopping any userland services.
+        # https://www.kernel.org/doc/html/latest/admin-guide/sysrq.html
+        signal.signal(signal.SIGALRM, self._zpool_export_sig_alarm)
         try:
-            with LockFile(FAILOVER_EVENT, timeout=0):
-                # The lockfile modules cleans up lockfiles if this script exits on it's own accord.
-                # For reboots, /tmp is cleared by virtue of being a memory device.
-                # If someone does a kill -9 on the script while it's running the lockfile
-                # will get left dangling.
-                self.logger.warn('Acquired failover backup lock')
-                run('pkill -9 -f fenced')
+            signal.alarm(ZPOOL_EXPORT_TIMEOUT)
+            # export the zpool(s)
+            for vol in fobj['volumes']:
+                if vol['status'] == 'ONLINE':
+                    self.run_call('zfs.pool.export', vol['name'])
+                    self.logger.warn(f'Exported {vol["name"]}')
+        except ZpoolExportTimeout:
+            # have to enable the "magic" sysrq triggers
+            with open('/proc/sys/kernel/sysrq') as f:
+                f.write('1')
 
-                for iface in fobj['non_crit_interfaces']:
-                    error, output = run(f"ifconfig {iface} | grep 'carp:' | awk '{{print $4}}'")
-                    for vhid in output.split():
-                        self.logger.warn('Setting advskew to 100 on non-critical interface %s', iface)
-                        run(f'ifconfig {iface} vhid {vhid} advskew 100')
+            # now violently reboot
+            with open('/proc/sysrq-trigger') as f:
+                f.write('b')
 
-                for group in fobj['groups']:
-                    for interface in fobj['groups'][group]:
-                        error, output = run(f"ifconfig {interface} | grep 'carp:' | awk '{{print $4}}'")
-                        for vhid in output.split():
-                            self.logger.warn('Setting advskew to 100 on critical interface %s', interface)
-                            run(f'ifconfig {interface} vhid {vhid} advskew 100')
+        # We also remove this file here, because on boot we become BACKUP if the other
+        # controller is MASTER. So this means we have no volumes to export which means
+        # the `ZPOOL_EXPORT_TIMEOUT` is honored.
+        with contextlib.suppress(Exception):
+            os.unlink(WATCHDOG_ALERT_FILE)
 
-                run('/sbin/pfctl -ef /etc/pf.conf.block')
+        self.logger.info('Refreshing failover status')
+        self.run_call('failover.status_refresh')
 
-                run('/usr/sbin/service watchdogd quietstop')
+        self.logger.info('Restarting syslog-ng')
+        self.run_call('service.restart', 'syslogd', HA_PROPAGATE)
 
-                # ticket 23361 enabled a feature to send email alerts when an unclean reboot occurrs.
-                # TrueNAS HA, by design, has a triggered unclean shutdown.
-                # If a controller is demoted to standby, we set a 4 sec countdown using watchdog.
-                # If the zpool(s) can't export within that timeframe, we use watchdog to violently reboot the controller.
-                # When this occurrs, the customer gets an email about an "Unauthorized system reboot".
-                # The idea for creating a new sentinel file for watchdog related panics,
-                # is so that we can send an appropriate email alert.
+        self.logger.info('Regenerating cron')
+        self.run_call('etc.generate', 'cron')
 
-                # If we panic here, middleware will check for this file and send an appropriate email.
-                # Ticket 39114
-                try:
-                    fd = os.open(WATCHDOG_ALERT_FILE, os.O_RDWR | os.O_CREAT | os.O_TRUNC)
-                    epoch = int(time.time())
-                    b = struct.pack("@i", epoch)
-                    os.write(fd, b)
-                    os.fsync(fd)
-                    os.close(fd)
-                except EnvironmentError as err:
-                    self.logger.warn(err)
+        self.logger.info('Stopping smartd')
+        self.run_call('service.stop', 'smartd', HA_PROPAGATE)
 
-                run('watchdog -t 4')
+        self.logger.info('Stopping collectd')
+        self.run_call('service.stop', 'collectd', HA_PROPAGATE)
 
-                # If the network is flapping, a backup node could get a master
-                # event followed by an immediate backup event.  If the other node
-                # is master and shoots down our master event we will immediately
-                # run the code for the backup event, even though we are already backup.
-                # So we use volumes as a sentinel to tell us if we did anything with
-                # regards to exporting volumes.  If we don't export any volumes it's
-                # ok to assume we don't need to do anything else associated with
-                # transitioning to the backup state. (because we are already there)
+        # we keep SSH running on both controllers (if it's enabled by user)
+        for i in fobj['services']:
+            if i['srv_service'] == 'ssh' and i['srv_enable']:
+                self.logger.info('Restarting SSH')
+                self.run_call('service.restart', 'ssh', HA_PROPAGATE)
 
-                # Note this wouldn't be needed with a proper state engine.
-                volumes = False
-                for volume in fobj['volumes'] + fobj['phrasedvolumes']:
-                    error, output = run(f'zpool list {volume}')
-                    if not error:
-                        volumes = True
-                        self.logger.warn('Exporting %s', volume)
-                        error, output = run(f'zpool export -f {volume}')
-                        if error:
-                            # the zpool status here is extranious.  The sleep
-                            # is going to run off the watchdog and the system will reboot.
-                            run(f'zpool status {volume}')
-                            time.sleep(5)
-                        self.logger.warn('Exported %s', volume)
+        # TODO: ALUA on SCALE??
+        # do something with iscsi service here
 
-                run('watchdog -t 0')
-                try:
-                    os.unlink(FAILOVER_ASSUMED_MASTER)
-                except Exception:
-                    pass
+        self.logger.info('Syncing encryption keys from MASTER node (if any)')
+        self.run_call('failover.call_remote', 'failover.sync_keys_to_remote_node')
 
-                # We also remove this file here, because this code path is executed on boot.
-                # The middlewared process is removing the file and then sending an email as expected.
-                # However, this python file is being called about 1min after middlewared and recreating the file on line 651.
-                try:
-                    os.unlink(WATCHDOG_ALERT_FILE)
-                except EnvironmentError:
-                    pass
+        self.logger.info('Successfully became the BACKUP node.')
+        FAILOVER_SUCCESSFUL = True
 
-                self.run_call('failover.status_refresh')
-                self.run_call('service.restart', 'syslogd', {'ha_propagate': False})
-
-                self.run_call('etc.generate', 'cron')
-
-                if volumes:
-                    run('/usr/sbin/service watchdogd quietstart')
-                    self.run_call('service.stop', 'smartd', {'ha_propagate': False})
-                    self.run_call('service.stop', 'collectd', {'ha_propagate': False})
-                    self.run_call('jail.stop_on_shutdown')
-                    for vm in (self.run_call('vm.query', [['status.state', '=', 'RUNNING']]) or []):
-                        self.run_call('vm.poweroff', vm['id'], True)
-                    run_async('echo "$(date), $(hostname), assume backup" | mail -s "Failover" root')
-
-                for i in (
-                    'ssh', 'iscsitarget',
-                ):
-                    verb = 'restart'
-                    if i == 'iscsitarget':
-                        if not self.run_call('iscsi.global.alua_enabled'):
-                            verb = 'stop'
-
-                    ret = self.run_call('datastore.query', 'services.services', [('srv_service', '=', i)])
-                    if ret and ret[0]['srv_enable']:
-                        self.run_call(f'service.{verb}', i, {'ha_propagate': False})
-
-                detach_all_job = self.run_call('failover.encryption_detachall')
-                detach_all_job.wait_sync()
-                if detach_all_job.error:
-                    self.logger.error('Failed to detach geli providers: %s', detach_all_job.error)
-
-                rem_version = self.run_call('failover.call_remote', 'system.info')['version'].split('-')
-                if len(rem_version) > 1 and rem_version[1].startswith('11'):
-                    passphrase = self.run_call('failover.call_remote', 'failover.encryption_getkey')
-                    self.run_call(
-                        'failover.update_encryption_keys', {
-                            'pools': [
-                                {'name': p['name'], 'passphrase': passphrase or ''}
-                                for p in self.middleware.call_sync('pool.query', [('encrypt', '=', 2)])
-                            ],
-                            'sync_keys': False,
-                        }
-                    )
-                else:
-                    self.run_call('failover.call_remote', 'failover.sync_keys_to_remote_node')
-
-        except AlreadyLocked:
-            self.logger.warn('Failover event handler failed to acquire backup lockfile')
+        return FAILOVER_SUCCESSFUL
 
 
 async def vrrp_fifo_hook(middleware, data):
