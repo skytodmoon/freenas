@@ -11,29 +11,13 @@ import time
 import contextlib
 import shutil
 import signal
+import logging
 
 from middlewared.utils import filter_list
 from middlewared.service import Service, private
 
+logger = logging.getLogger('failover')
 
-# This is the primitive lock used to protect a failover "event".
-# This means that we will grab an exclusive lock before
-# we call any of the code that does any of the work.
-# This does a few things:
-#
-#    1. protects us if we have an interface that has a
-#        rapid succession of state changes
-#
-#    2. if we have a near simultaneous amount of
-#        events get triggered for all interfaces
-#        --this can happen on external network failure
-#        --this happens when one node reboots
-#        --this happens when keepalived service is restarted
-#
-# If any of the above scenarios occur, we want to ensure
-# that only one thread is trying to run fenced or import the
-# zpools.
-EVENT_LOCK = Lock()
 
 # file created by the pool plugin during certain
 # scenarios when importing zpools on boot
@@ -57,20 +41,6 @@ WATCHDOG_ALERT_FILE = "/data/sentinels/.watchdog-alert"
 # zpool(s) when becoming the BACKUP node
 ZPOOL_EXPORT_TIMEOUT = 4  # seconds
 
-# list of critical services that get restarted first
-# before the other services during a failover event
-CRITICAL_SERVICES = ['iscsitarget', 'cifs', 'nfs', 'afp']
-
-# boolean that represents if a failover event was successful
-# or not
-FAILOVER_SUCCESSFUL = False
-
-# option to be given when changing the state of a service
-# during a failover event, we do not want to replicate
-# the state of a service to the other controller since
-# that's being handled by us explicitly
-HA_PROPAGATE = {'ha_propagate': False}
-
 
 class ZpoolExportTimeout(Exception):
 
@@ -92,12 +62,46 @@ class IgnoreFailoverEvent(Exception):
 
 class FailoverService(Service):
 
+    def __init__(self):
+
+        # boolean that represents if a failover event was successful or not
+        self.failover_successful = False
+
+        # list of critical services that get restarted first
+        # before the other services during a failover event
+        self.critical_services = ['iscsitarget', 'cifs', 'nfs', 'afp']
+
+        # option to be given when changing the state of a service
+        # during a failover event, we do not want to replicate
+        # the state of a service to the other controller since
+        # that's being handled by us explicitly
+        self.ha_propagate = {'ha_propagate': False}
+
+        # This is the primitive lock used to protect a failover "event".
+        # This means that we will grab an exclusive lock before
+        # we call any of the code that does any of the work.
+        # This does a few things:
+        #
+        #    1. protects us if we have an interface that has a
+        #        rapid succession of state changes
+        #
+        #    2. if we have a near simultaneous amount of
+        #        events get triggered for all interfaces
+        #        --this can happen on external network failure
+        #        --this happens when one node reboots
+        #        --this happens when keepalived service is restarted
+        #
+        # If any of the above scenarios occur, we want to ensure
+        # that only one thread is trying to run fenced or import the
+        # zpools.
+        self.event_lock = Lock()
+
     @private
     def run_call(self, method, *args, **kwargs):
         try:
             return self.middleware.call_sync(method, *args, **kwargs)
         except Exception as e:
-            self.logger.error('Failed to run %s:%r:%r %s', method, args, kwargs, e)
+            logger.error('Failed to run %s:%r:%r %s', method, args, kwargs, e)
 
     @private
     def event(self, ifname, event):
@@ -122,8 +126,7 @@ class FailoverService(Service):
 
         # only care about name, guid, and status
         volumes = self.run_call(
-            'pool.query', [],
-            {
+            'pool.query', [], {
                 'select': ['name', 'guid', 'status']
             }
         )
@@ -165,8 +168,8 @@ class FailoverService(Service):
 
         # first thing to check is if there is an ongoing event
         # if there is, ignore it
-        if EVENT_LOCK.locked():
-            self.logger.warning('Failover event is already being processed, ignoring.')
+        if self.event_lock.locked():
+            logger.warning('Failover event is already being processed, ignoring.')
             raise IgnoreFailoverEvent()
 
         forcetakeover = False
@@ -177,13 +180,13 @@ class FailoverService(Service):
         fobj = self.generate_failover_data()
 
         # grab the primitive lock
-        with EVENT_LOCK:
+        with self.event_lock:
             if not forcetakeover:
                 if fobj['disabled'] and not fobj['master']:
                     # if forcetakeover is false, and failover is disabled
                     # and we're not set as the master controller, then
                     # there is nothing we need to do.
-                    self.logger.warning('Failover is disabled, assuming backup.')
+                    logger.warning('Failover is disabled, assuming backup.')
                     self.run_call('service.restart', 'keepalived')
                     return
 
@@ -194,17 +197,17 @@ class FailoverService(Service):
                 # ignore the event and return
                 ignore = [i for i in fobj['non_crit_interfaces'] if i in ifname]
                 if ignore:
-                    self.logger.warning(f'Ignoring state change on non-critical interface:{ifname}.')
+                    logger.warning(f'Ignoring state change on non-critical interface:{ifname}.')
                     raise IgnoreFailoverEvent()
 
                 # if the other controller is already master, then assume backup
                 try:
                     if self.call_sync('failover.call_remote', 'failover.status') == 'MASTER':
-                        self.logger.warning('Other node is already active, assuming backup.')
+                        logger.warning('Other node is already active, assuming backup.')
                         self.run_call('service.restart', 'keepalived')
                         return
                 except Exception:
-                    self.logger.error('Failed to contact the other node', exc_info=True)
+                    logger.error('Failed to contact the other node', exc_info=True)
 
                 # ensure the zpools are imported
                 needs_imported = False
@@ -217,12 +220,12 @@ class FailoverService(Service):
                         try:
                             self.run_call('failover.call_remote', 'service.restart', ['keepalived'])
                         except Exception:
-                            self.logger.error('Failed contacting standby controller when restarting vrrp.', exc_info=True)
+                            logger.error('Failed contacting standby controller when restarting vrrp.', exc_info=True)
                         break
 
                 # means all zpools are already imported so nothing else to do
                 if not needs_imported:
-                    self.logger.warning('Failover disabled but zpool(s) are imported. Assuming active.')
+                    logger.warning('Failover disabled but zpool(s) are imported. Assuming active.')
                     return
                 # means at least 1 of the zpools are not imported so act accordingly
                 else:
@@ -258,27 +261,44 @@ class FailoverService(Service):
         fenced_error = None
         if forcetakeover or force_fenced:
             # reserve the disks forcefully ignoring if the other node has the disks
-            self.logger.warning('Forcefully taking over as the MASTER node.')
+            logger.warning('Forcefully taking over as the MASTER node.')
             fenced_error = self.run_call('failover.fenced.start', force=True)
         else:
-            self.logger.warning(f'Entering MASTER on {ifname}.')
+            # we need to check a few things before we start fenced and start the process
+            # of becoming master
+            #
+            #   1. if the interface that we've received a MASTER event for is
+            #       in a failover group with another interface. If ANY of the
+            #       other interfaces in that failover group are still MASTER,
+            #       then we need to ignore the event.
+            #
+            #   TODO: Not sure how keepalived and laggs operate so need to test this
+            #           (maybe the event only gets triggered if the lagg goes down)
+            #   2. if the interfaces that we've received a MASTER event for is
+            #       a member of a lagg interface and the other members in that lagg
+            #       are functional, then we need to ignore the event.
+            #
+            if not self.run_call('failover.vip.check_failover_group', ifname, fobj['groups']):
+                pass
+
+            logger.warning(f'Entering MASTER on {ifname}.')
             fenced_error = self.run_call('failover.fenced.start')
 
         # starting fenced daemon failed....which is bad
         # emit an error and exit
         if fenced_error:
             if fenced_error == 1:
-                self.logger.error('Failed to register keys on disks, exiting!')
+                logger.error('Failed to register keys on disks, exiting!')
             elif fenced_error == 2:
-                self.logger.error('Fenced is running on the remote node, exiting!')
+                logger.error('Fenced is running on the remote node, exiting!')
             elif fenced_error == 3:
-                self.logger.error('10% or more of the disks failed to be reserved, exiting!')
+                logger.error('10% or more of the disks failed to be reserved, exiting!')
             elif fenced_error == 5:
-                self.logger.warn('Fencing daemon encountered an unexpected fatal error, exiting!')
+                logger.error('Fenced encountered an unexpected fatal error, exiting!')
             else:
-                self.logger.warn(f'Fenced exited with code:{fenced_error} which should never happen, exiting!')
+                logger.error(f'Fenced exited with code:{fenced_error} which should never happen, exiting!')
 
-            return FAILOVER_SUCCESSFUL
+            return self.failover_successful
 
         # remove the zpool cache files if necessary
         if os.path.exists(ZPOOL_KILLCACHE):
@@ -305,7 +325,7 @@ class FailoverService(Service):
 
         failed = []
         for vol in fobj['volumes']:
-            self.logger.info(f'Importing {vol["name"]}')
+            logger.info(f'Importing {vol["name"]}')
 
             # try to import the zpool(s)
             try:
@@ -326,41 +346,41 @@ class FailoverService(Service):
             unlock_job = self.run_call('failover.unlock_zfs_datasets', vol["name"])
             unlock_job.wait_sync()
             if unlock_job.error:
-                self.logger.error(f'Error unlocking ZFS encrypted datasets: {unlock_job.error}')
+                logger.error(f'Error unlocking ZFS encrypted datasets: {unlock_job.error}')
             elif unlock_job.result['failed']:
-                self.logger.error('Failed to unlock %s ZFS encrypted dataset(s)', ','.join(unlock_job.result['failed']))
+                logger.error('Failed to unlock %s ZFS encrypted dataset(s)', ','.join(unlock_job.result['failed']))
 
         # if we fail to import all zpools then alert the user because nothing
         # is going to work at this point
         if len(failed) == len(fobj['volumes']):
             for i in failed:
-                self.logger.error(
+                logger.error(
                     f'Failed to import volume with name:{failed["name"]} with guid:{failed["guid"]} '
                     'with error:{failed["error"]}'
                 )
 
-            self.logger.error('All volumes failed to import!')
-            return FAILOVER_SUCCESSFUL
+            logger.error('All volumes failed to import!')
+            return self.failover_successful
 
         # if we fail to import any of the zpools then alert the user but continue the process
         for i in failed:
-            self.logger.error(
+            logger.error(
                 f'Failed to import volume with name:{failed["name"]} with guid:{failed["guid"]} '
                 'with error:{failed["error"]}. '
                 'However, other zpools imported so we continued the failover process.'
             )
 
-        self.logger.info('Volume imports complete.')
+        logger.info('Volume imports complete.')
 
         # need to make sure failover status is updated in the middleware cache
-        self.logger.info('Refreshing failover status')
+        logger.info('Refreshing failover status')
         self.run_call('failover.status_refresh')
 
         # this enables all necessary services that have been enabled by the user
-        self.logger.info('Enabling necessary services.')
+        logger.info('Enabling necessary services.')
         self.run_call('etc.generate', 'rc')
 
-        self.logger.info('Configuring system dataset')
+        logger.info('Configuring system dataset')
         self.run_call('etc.generate', 'system_dataset')
 
         # Write the certs to disk based on what is written in db.
@@ -369,56 +389,56 @@ class FailoverService(Service):
         self.run_call('service.restart', 'http')
 
         # now we restart the services, prioritizing the "critical" services
-        self.logger.info('Restarting critical services.')
-        for i in CRITICAL_SERVICES:
+        logger.info('Restarting critical services.')
+        for i in self.critical_services:
             for j in fobj['services']:
                 if i == j['srv_service'] and j['srv_enable']:
-                    self.logger.info(f'Restarting critical service:{i}')
-                    self.run_call('service.restart', i, HA_PROPAGATE)
+                    logger.info(f'Restarting critical service:{i}')
+                    self.run_call('service.restart', i, self.ha_propagate)
 
         # TODO: look at nftables
-        # self.logger.info('Allowing network traffic.')
+        # logger.info('Allowing network traffic.')
         # run('/sbin/pfctl -d')
 
-        self.logger.info('Critical portion of failover is now complete')
+        logger.info('Critical portion of failover is now complete')
 
         # regenerate cron
-        self.logger.info('Regenerating cron')
+        logger.info('Regenerating cron')
         self.run_call('etc.generate', 'cron')
 
         # sync disks is disabled on passive node
-        self.logger.info('Syncing disks')
+        logger.info('Syncing disks')
         self.run_call('disk.sync_all')
 
-        self.logger.info('Syncing enclosure')
+        logger.info('Syncing enclosure')
         self.run_call('enclosure.sync_zpool')
 
         # restart the remaining "non-critical" services
-        self.logger.info('Restarting remaining services')
+        logger.info('Restarting remaining services')
 
-        self.logger.info('Restarting collected')
-        self.run_call('service.restart', 'collectd', HA_PROPAGATE)
+        logger.info('Restarting collected')
+        self.run_call('service.restart', 'collectd', self.ha_propagate)
 
-        self.logger.info('Restarting syslog-ng')
-        self.run_call('service.restart', 'syslogd', HA_PROPAGATE)
+        logger.info('Restarting syslog-ng')
+        self.run_call('service.restart', 'syslogd', self.ha_propagate)
 
         for i in fobj['services']:
-            if i['srv_service'] not in CRITICAL_SERVICES and i['srv_enable']:
-                self.logger.info('Restarting service:{i["srv_service"]}')
-                self.run_call('service.restart', i['srv_service'], HA_PROPAGATE)
+            if i['srv_service'] not in self.critical_services and i['srv_enable']:
+                logger.info('Restarting service:{i["srv_service"]}')
+                self.run_call('service.restart', i['srv_service'], self.ha_propagate)
 
         # TODO: jails don't exist on SCALE (yet)
         # TODO: vms don't exist on SCALE (yet)
         # self.run_call('jail.start_on_boot')
         # self.run_call('vm.start_on_boot')
 
-        self.logger.info('Initializing alert system')
+        logger.info('Initializing alert system')
         self.run_call('alert.block_failover_alerts')
         self.run_call('alert.initialize', False)
 
         kmip_config = self.run_call('kmip.config')
         if kmip_config and kmip_config['enabled']:
-            self.logger.info('Syncing encryption keys with KMIP server')
+            logger.info('Syncing encryption keys with KMIP server')
 
             # Even though we keep keys in sync, it's best that we do this as well
             # to ensure that the system is up to date with the latest keys available
@@ -426,15 +446,15 @@ class FailoverService(Service):
             # meanwhile.
             self.run_call('kmip.initialize_keys')
 
-        self.logger.warn('Failover event complete.')
-        failover_succesful = True
+        logger.info('Failover event complete.')
+        self.failover_successful = True
 
-        return failover_succesful
+        return self.failover_successful
 
     @private
     def vrrp_backup(self, fobj, ifname, event, force_fenced):
 
-        self.logger.warning(f'Entering BACKUP on {ifname}')
+        logger.warning(f'Entering BACKUP on {ifname}')
 
         # we need to stop fenced first
         self.run_call('failover.fenced.stop')
@@ -442,11 +462,11 @@ class FailoverService(Service):
         # restarting keepalived sends a priority 0 advertisement
         # which means any VIP that is on this controller will be
         # migrated to the other controller
-        self.logger.info('Transitioning all VIPs off this node')
+        logger.info('Transitioning all VIPs off this node')
         self.run_call('service.restart', 'keepalived')
 
         # TODO: look at nftables
-        # self.logger.info('Enabling firewall')
+        # logger.info('Enabling firewall')
         # run('/sbin/pfctl -ef /etc/pf.conf.block')
 
         # ticket 23361 enabled a feature to send email alerts when an unclean reboot occurrs.
@@ -477,7 +497,7 @@ class FailoverService(Service):
             for vol in fobj['volumes']:
                 if vol['status'] == 'ONLINE':
                     self.run_call('zfs.pool.export', vol['name'])
-                    self.logger.warn(f'Exported {vol["name"]}')
+                    logger.info(f'Exported {vol["name"]}')
         except ZpoolExportTimeout:
             # have to enable the "magic" sysrq triggers
             with open('/proc/sys/kernel/sysrq') as f:
@@ -493,37 +513,37 @@ class FailoverService(Service):
         with contextlib.suppress(Exception):
             os.unlink(WATCHDOG_ALERT_FILE)
 
-        self.logger.info('Refreshing failover status')
+        logger.info('Refreshing failover status')
         self.run_call('failover.status_refresh')
 
-        self.logger.info('Restarting syslog-ng')
-        self.run_call('service.restart', 'syslogd', HA_PROPAGATE)
+        logger.info('Restarting syslog-ng')
+        self.run_call('service.restart', 'syslogd', self.ha_propagate)
 
-        self.logger.info('Regenerating cron')
+        logger.info('Regenerating cron')
         self.run_call('etc.generate', 'cron')
 
-        self.logger.info('Stopping smartd')
-        self.run_call('service.stop', 'smartd', HA_PROPAGATE)
+        logger.info('Stopping smartd')
+        self.run_call('service.stop', 'smartd', self.ha_propagate)
 
-        self.logger.info('Stopping collectd')
-        self.run_call('service.stop', 'collectd', HA_PROPAGATE)
+        logger.info('Stopping collectd')
+        self.run_call('service.stop', 'collectd', self.ha_propagate)
 
         # we keep SSH running on both controllers (if it's enabled by user)
         for i in fobj['services']:
             if i['srv_service'] == 'ssh' and i['srv_enable']:
-                self.logger.info('Restarting SSH')
-                self.run_call('service.restart', 'ssh', HA_PROPAGATE)
+                logger.info('Restarting SSH')
+                self.run_call('service.restart', 'ssh', self.ha_propagate)
 
         # TODO: ALUA on SCALE??
         # do something with iscsi service here
 
-        self.logger.info('Syncing encryption keys from MASTER node (if any)')
+        logger.info('Syncing encryption keys from MASTER node (if any)')
         self.run_call('failover.call_remote', 'failover.sync_keys_to_remote_node')
 
-        self.logger.info('Successfully became the BACKUP node.')
-        FAILOVER_SUCCESSFUL = True
+        logger.info('Successfully became the BACKUP node.')
+        self.failover_successful = True
 
-        return FAILOVER_SUCCESSFUL
+        return self.failover_successful
 
 
 async def vrrp_fifo_hook(middleware, data):
