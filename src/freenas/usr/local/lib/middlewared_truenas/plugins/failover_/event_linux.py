@@ -236,43 +236,50 @@ class FailoverService(Service):
     @private
     def vrrp_master(self, fobj, ifname, vhid, event, force_fenced, forcetakeover):
 
-        # first thing to do is stop fenced process just in case it's running already
-        # we will restart it based on args passed to us
-        # NOTE: this does not cause concern because:
-        #
-        #    1. if fenced was already running then the disks have been reserved
-        #       and stopping the process does not clear the reservations
-        #
-        #    2. if fenced was not already running then the disks were probably
-        #       not reserved by us so we will reserve them eventually (or error)
-        #       based on the args passed to this method
-        #
-        self.run_call('failover.fenced.stop')
-
         fenced_error = None
         if forcetakeover or force_fenced:
             # reserve the disks forcefully ignoring if the other node has the disks
             logger.warning('Forcefully taking over as the MASTER node.')
+
+            # need to stop fenced just in case it's running already
+            self.run_call('failover.fenced.stop')
+
+            logger.warning('Forcefully starting fenced')
             fenced_error = self.run_call('failover.fenced.start', force=True)
         else:
-            # we need to check a few things before we start fenced and start the process
-            # of becoming master
+            # if we're here then we need to check a couple things before we start fenced
+            # and start the process of becoming master
             #
             #   1. if the interface that we've received a MASTER event for is
-            #       in a failover group with another interface. If ANY of the
-            #       other interfaces in that failover group are still MASTER,
+            #       in a failover group with other interfaces and ANY of the
+            #       other members in the failover group are still BACKUP,
             #       then we need to ignore the event.
             #
             #   TODO: Not sure how keepalived and laggs operate so need to test this
             #           (maybe the event only gets triggered if the lagg goes down)
-            #   2. if the interfaces that we've received a MASTER event for is
-            #       a member of a lagg interface and the other members in that lagg
-            #       are functional, then we need to ignore the event.
             #
-            if not self.run_call('failover.vip.check_failover_group', ifname, fobj['groups']):
-                pass
+            status = self.run_call(
+                'failover.vip.check_failover_group', ifname, fobj['groups']
+            )
+
+            # this means that we received a master event and the interface was
+            # in a failover group. And in that failover group, there were other
+            # interfaces that were still in the BACKUP state which means the
+            # other node has them as MASTER so ignore the event.
+            if len(status[1]):
+                logger.warning(
+                    f'Received MASTER event for {ifname}, but other '
+                    'interfaces "{backups}" are still working on the '
+                    'MASTER node. Ignoring event.'
+                )
+                raise IgnoreFailoverEvent
 
             logger.warning(f'Entering MASTER on {ifname}.')
+
+            # need to stop fenced just in case it's running already
+            self.run_call('failover.fenced.stop')
+
+            logger.warning('Starting fenced')
             fenced_error = self.run_call('failover.fenced.start')
 
         # starting fenced daemon failed....which is bad
@@ -445,9 +452,36 @@ class FailoverService(Service):
     @private
     def vrrp_backup(self, fobj, ifname, event, force_fenced):
 
+        # we need to check a couple things before we stop fenced
+        # and start the process of becoming backup
+        #
+        #   1. if the interface that we've received a BACKUP event for is
+        #       in a failover group with other interfaces and ANY of the
+        #       other members in the failover group are still MASTER,
+        #       then we need to ignore the event.
+        #
+        #   TODO: Not sure how keepalived and laggs operate so need to test this
+        #           (maybe the event only gets triggered if the lagg goes down)
+        #
+        status = self.run_call(
+            'failover.vip.check_failover_group', ifname, fobj['groups']
+        )
+
+        # this means that we received a backup event and the interface was
+        # in a failover group. And in that failover group, there were other
+        # interfaces that were still in the MASTER state so ignore the event.
+        if len(status[0]):
+            logger.warning(
+                f'Received BACKUP event for {ifname}, but other '
+                'interfaces "{masters}" are still working. '
+                'Ignoring event.'
+            )
+            raise IgnoreFailoverEvent
+
         logger.warning(f'Entering BACKUP on {ifname}')
 
         # we need to stop fenced first
+        logger.warning('Stopping fenced')
         self.run_call('failover.fenced.stop')
 
         # restarting keepalived sends a priority 0 advertisement

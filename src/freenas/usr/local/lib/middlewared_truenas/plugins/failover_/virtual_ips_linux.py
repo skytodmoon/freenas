@@ -1,5 +1,6 @@
 from middlewared.service import private, Service
 from middlewared.utils import filter_list
+from middlewared.plugins.interface.netif import netif
 
 
 class DetectVirtualIpStates(Service):
@@ -11,8 +12,10 @@ class DetectVirtualIpStates(Service):
     async def check_failover_group(self, ifname, groups):
 
         """
-        Check the other members (if any) in failover group for `iface`.
+        Check the other members (if any) in failover group for `ifname`
         """
+
+        masters, backups = [], []
 
         # get failover group id for `iface`
         group_id = [group for group, names in groups.items() if ifname in names][0]
@@ -23,21 +26,23 @@ class DetectVirtualIpStates(Service):
         # need to remove the passed in `ifname` from the list
         ids.remove(ifname)
 
-        # we have more than one interface in the failover group
-        # so check the members and see if they have their
-        # respective VIP addresses assigned to them
-        #
         # if the user provided VIP(s) is/are missing from the interface
         # then it's considered "BACKUP" else "MASTER" so return
         # True for healthy (MASTER) or False for not healthy (BACKUP)
         # maybe?? Not sure, need to work on networking API first
-        for id in ids:
-            pass
+        if len(ids):
 
-        # TODO: keepalived on scale is responsible for adding/removing the VIP
-        # to the given interface. Furthermore, the "VHID" paradigm doesn't
-        # apply so need to figure out how to best return "vrrp_config"
-        return
+            # we have more than one interface in the failover group
+            # so check the state of the interface
+            for i in ids:
+                iface = netif.get_interface(i)
+                for j in iface.vrrp_config:
+                    if j['state'] == 'MASTER':
+                        masters.append(i)
+                    else:
+                        backups.append(i)
+
+        return masters, backups
 
     @private
     async def get_states(self, interfaces=None):
@@ -56,16 +61,13 @@ class DetectVirtualIpStates(Service):
                 continue
             if iface['name'] not in crit_ifaces:
                 continue
-            # TODO: need to figure out how to make as minimal amount of breaking
-            # API changes to networking API to return "vrrp_config" instead of
-            # "carp_config"
             if iface['state']['vrrp_config'][0]['state'] == 'MASTER':
                 masters.append(iface['name'])
             if iface['state']['vrrp_config'][0]['state'] == 'BACKUP':
                 backups.append(iface['name'])
             else:
                 self.logger.warning(
-                    'Unknown VRRP state %r for interface %s', iface['state']['carp_config'][0]['state'], iface['name']
+                    'Unknown VRRP state %r for interface %s', iface['state']['vrrp_config'][0]['state'], iface['name']
                 )
 
         return masters, backups, inits
@@ -73,6 +75,18 @@ class DetectVirtualIpStates(Service):
     @private
     async def check_states(self, local, remote):
 
-        # TODO
-        # Read above comment in `get_states` method
-        return []
+        errors = []
+
+        interfaces = set(local[0] + local[1] + remote[0] + remote[1])
+        if not interfaces:
+            errors.append('There are no failover interfaces')
+
+        for name in interfaces:
+            if name not in local[0] and name in remote[0]:
+                errors.append(f'Interface {name} is MASTER on standby node')
+            if name in local[1] and name in remote[1]:
+                errors.append(f'Interface {name} is BACKUP on both nodes')
+            if name in local[0] and name in remote[0]:
+                errors.append(f'Interface {name} is MASTER on both nodes')
+
+        return errors
