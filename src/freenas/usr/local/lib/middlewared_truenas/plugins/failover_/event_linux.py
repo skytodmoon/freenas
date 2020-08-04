@@ -1,9 +1,3 @@
-# Copyright (c) 2020 iXsystems, Inc.
-# All rights reserved.
-# This file is a part of TrueNAS
-# and may not be copied and/or distributed
-# without the express permission of iXsystems.
-
 from collections import defaultdict
 from threading import Lock
 import os
@@ -19,27 +13,24 @@ from middlewared.service import Service, private
 logger = logging.getLogger('failover')
 
 
-# file created by the pool plugin during certain
-# scenarios when importing zpools on boot
-ZPOOL_KILLCACHE = '/data/zfs/killcache'
-
-# zpool cache file managed by ZFS
-ZPOOL_CACHE_FILE = '/data/zfs/zpool.cache'
-
-# zpool cache file that's been saved by pool plugin
-# during certain scenarios importing zpools on boot
-ZPOOL_CACHE_FILE_SAVED = f'{ZPOOL_CACHE_FILE}.saved'
-
-# Samba sentinel file
-SAMBA_USER_IMPORT_FILE = "/root/samba/.usersimported"
-
-# This file is managed in unscheduled_reboot_alert.py
-# Ticket 39114
-WATCHDOG_ALERT_FILE = "/data/sentinels/.watchdog-alert"
-
-# this is the time limit we place on exporting the
-# zpool(s) when becoming the BACKUP node
-ZPOOL_EXPORT_TIMEOUT = 4  # seconds
+# This is the primitive lock used to protect a failover "event".
+# This means that we will grab an exclusive lock before
+# we call any of the code that does any of the work.
+# This does a few things:
+#
+#    1. protects us if we have an interface that has a
+#        rapid succession of state changes
+#
+#    2. if we have a near simultaneous amount of
+#        events get triggered for all interfaces
+#        --this can happen on external network failure
+#        --this happens when one node reboots
+#        --this happens when keepalived service is restarted
+#
+# If any of the above scenarios occur, we want to ensure
+# that only one thread is trying to run fenced or import the
+# zpools.
+EVENT_LOCK = Lock()
 
 
 class ZpoolExportTimeout(Exception):
@@ -77,24 +68,24 @@ class FailoverService(Service):
         # that's being handled by us explicitly
         self.ha_propagate = {'ha_propagate': False}
 
-        # This is the primitive lock used to protect a failover "event".
-        # This means that we will grab an exclusive lock before
-        # we call any of the code that does any of the work.
-        # This does a few things:
-        #
-        #    1. protects us if we have an interface that has a
-        #        rapid succession of state changes
-        #
-        #    2. if we have a near simultaneous amount of
-        #        events get triggered for all interfaces
-        #        --this can happen on external network failure
-        #        --this happens when one node reboots
-        #        --this happens when keepalived service is restarted
-        #
-        # If any of the above scenarios occur, we want to ensure
-        # that only one thread is trying to run fenced or import the
-        # zpools.
-        self.event_lock = Lock()
+        # file created by the pool plugin during certain
+        # scenarios when importing zpools on boot
+        self.zpool_killcache = '/data/zfs/killcache'
+
+        # zpool cache file managed by ZFS
+        self.zpool_cache_file = '/data/zfs/zpool.cache'
+
+        # zpool cache file that's been saved by pool plugin
+        # during certain scenarios importing zpools on boot
+        self.zpool_cache_file_saved = f'{self.zpool_cache_file}.saved'
+
+        # This file is managed in unscheduled_reboot_alert.py
+        # Ticket 39114
+        self.watchdog_alert_file = "/data/sentinels/.watchdog-alert"
+
+        # this is the time limit we place on exporting the
+        # zpool(s) when becoming the BACKUP node
+        self.zpool_export_timeout = 4  # seconds
 
     @private
     def run_call(self, method, *args, **kwargs):
@@ -168,7 +159,7 @@ class FailoverService(Service):
 
         # first thing to check is if there is an ongoing event
         # if there is, ignore it
-        if self.event_lock.locked():
+        if EVENT_LOCK.locked():
             logger.warning('Failover event is already being processed, ignoring.')
             raise IgnoreFailoverEvent()
 
@@ -180,7 +171,7 @@ class FailoverService(Service):
         fobj = self.generate_failover_data()
 
         # grab the primitive lock
-        with self.event_lock:
+        with EVENT_LOCK:
             if not forcetakeover:
                 if fobj['disabled'] and not fobj['master']:
                     # if forcetakeover is false, and failover is disabled
@@ -301,27 +292,27 @@ class FailoverService(Service):
             return self.failover_successful
 
         # remove the zpool cache files if necessary
-        if os.path.exists(ZPOOL_KILLCACHE):
-            for i in (ZPOOL_CACHE_FILE, ZPOOL_CACHE_FILE_SAVED):
+        if os.path.exists(self.zpool_killcache):
+            for i in (self.zpool_cache_file, self.zpool_cache_file_saved):
                 with contextlib.suppress(Exception):
                     os.unlink(i)
 
-        # create the ZPOOL_KILLCACHE file
+        # create the self.zpool_killcache file
         else:
             with contextlib.suppress(Exception):
-                with open(ZPOOL_KILLCACHE, 'w') as f:
+                with open(self.zpool_killcache, 'w') as f:
                     f.flush()  # be sure it goes straight to disk
                     os.fsync(f.fileno())  # be EXTRA sure it goes straight to disk
 
         # if we're here and the zpool "saved" cache file exists we need to check
         # if it's modify time is < the standard zpool cache file and if it is
         # we overwrite the zpool "saved" cache file with the standard one
-        if os.path.exists(ZPOOL_CACHE_FILE_SAVED) and os.path.exists(ZPOOL_CACHE_FILE):
-            zpool_cache_mtime = os.stat(ZPOOL_CACHE_FILE).st_mtime
-            zpool_cache_saved_mtime = os.stat(ZPOOL_CACHE_FILE_SAVED).st_mtime
+        if os.path.exists(self.zpool_cache_file_saved) and os.path.exists(self.zpool_cache_file):
+            zpool_cache_mtime = os.stat(self.zpool_cache_file).st_mtime
+            zpool_cache_saved_mtime = os.stat(self.zpool_cache_file_saved).st_mtime
             if zpool_cache_mtime > zpool_cache_saved_mtime:
                 with contextlib.suppress(Exception):
-                    shutil.copy2(ZPOOL_CACHE_FILE, ZPOOL_CACHE_FILE_SAVED)
+                    shutil.copy2(self.zpool_cache_file, self.zpool_cache_file_saved)
 
         failed = []
         for vol in fobj['volumes']:
@@ -334,7 +325,7 @@ class FailoverService(Service):
                     vol['guid'],
                     {
                         'altroot': '/mnt',
-                        'cachefile': ZPOOL_CACHE_FILE,
+                        'cachefile': self.zpool_cache_file,
                     }
                 )
             except Exception as e:
@@ -479,12 +470,12 @@ class FailoverService(Service):
         # So if we panic here, middleware will check for this file and send an appropriate email.
         # ticket 39114
         with contextlib.suppress(Exception):
-            with open(WATCHDOG_ALERT_FILE, 'w') as f:
+            with open(self.watchdog_alert_file, 'w') as f:
                 f.write(int(time.time()))
                 f.flush()  # be sure it goes straight to disk
                 os.fsync(f.fileno())  # be EXTRA sure it goes straight to disk
 
-        # set a countdown = to ZPOOL_EXPORT_TIMEOUT.
+        # set a countdown = to self.zpool_export_timeout.
         # if we can't export the zpool(s) in this timeframe,
         # we send the 'b' character to the /proc/sysrq-trigger
         # to trigger an immediate reboot of the system without
@@ -492,7 +483,7 @@ class FailoverService(Service):
         # https://www.kernel.org/doc/html/latest/admin-guide/sysrq.html
         signal.signal(signal.SIGALRM, self._zpool_export_sig_alarm)
         try:
-            signal.alarm(ZPOOL_EXPORT_TIMEOUT)
+            signal.alarm(self.zpool_export_timeout)
             # export the zpool(s)
             for vol in fobj['volumes']:
                 if vol['status'] == 'ONLINE':
@@ -509,9 +500,9 @@ class FailoverService(Service):
 
         # We also remove this file here, because on boot we become BACKUP if the other
         # controller is MASTER. So this means we have no volumes to export which means
-        # the `ZPOOL_EXPORT_TIMEOUT` is honored.
+        # the `self.zpool_export_timeout` is honored.
         with contextlib.suppress(Exception):
-            os.unlink(WATCHDOG_ALERT_FILE)
+            os.unlink(self.watchdog_alert_file)
 
         logger.info('Refreshing failover status')
         self.run_call('failover.status_refresh')
