@@ -269,7 +269,7 @@ class FailoverService(Service):
             if len(status[1]):
                 logger.warning(
                     f'Received MASTER event for {ifname}, but other '
-                    'interfaces "{backups}" are still working on the '
+                    'interfaces "{status[0]}" are still working on the '
                     'MASTER node. Ignoring event.'
                 )
                 raise IgnoreFailoverEvent
@@ -473,7 +473,7 @@ class FailoverService(Service):
         if len(status[0]):
             logger.warning(
                 f'Received BACKUP event for {ifname}, but other '
-                'interfaces "{masters}" are still working. '
+                'interfaces "{status[1]}" are still working. '
                 'Ignoring event.'
             )
             raise IgnoreFailoverEvent
