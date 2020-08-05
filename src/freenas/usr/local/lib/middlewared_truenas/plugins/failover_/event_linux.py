@@ -179,7 +179,7 @@ class FailoverService(Service):
                     # there is nothing we need to do.
                     logger.warning('Failover is disabled, assuming backup.')
                     self.run_call('service.restart', 'keepalived')
-                    return
+                    raise IgnoreFailoverEvent()
 
                 # any logic below here means failover is disabled and we are
                 # designated as the master controller so act accordingly
@@ -196,7 +196,7 @@ class FailoverService(Service):
                     if self.call_sync('failover.call_remote', 'failover.status') == 'MASTER':
                         logger.warning('Other node is already active, assuming backup.')
                         self.run_call('service.restart', 'keepalived')
-                        return
+                        raise IgnoreFailoverEvent()
                 except Exception:
                     logger.error('Failed to contact the other node', exc_info=True)
 
@@ -325,7 +325,7 @@ class FailoverService(Service):
         for vol in fobj['volumes']:
             logger.info(f'Importing {vol["name"]}')
 
-            # try to import the zpool(s)
+            # import the zpool(s)
             try:
                 self.run_call(
                     'zfs.pool.import_pool',
@@ -512,17 +512,20 @@ class FailoverService(Service):
         # set a countdown = to self.zpool_export_timeout.
         # if we can't export the zpool(s) in this timeframe,
         # we send the 'b' character to the /proc/sysrq-trigger
-        # to trigger an immediate reboot of the system without
-        # syncing anything to disk or stopping any userland services.
+        # to trigger an immediate reboot of the system
         # https://www.kernel.org/doc/html/latest/admin-guide/sysrq.html
         signal.signal(signal.SIGALRM, self._zpool_export_sig_alarm)
         try:
             signal.alarm(self.zpool_export_timeout)
             # export the zpool(s)
-            for vol in fobj['volumes']:
-                if vol['status'] == 'ONLINE':
-                    self.run_call('zfs.pool.export', vol['name'])
+            try:
+                for vol in fobj['volumes']:
+                    self.run_call('zfs.pool.export', vol['name'], {'force': True})
                     logger.info(f'Exported {vol["name"]}')
+            except Exception:
+                # catch any exception that could be raised
+                # We sleep for 5 seconds to cause the signal timeout to occur.
+                time.sleep(5)
         except ZpoolExportTimeout:
             # have to enable the "magic" sysrq triggers
             with open('/proc/sys/kernel/sysrq') as f:
